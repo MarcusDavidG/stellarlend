@@ -34,6 +34,10 @@ export interface TWAPConfig {
   maxStalenessSeconds: number;
   /** Whether to use single-update-per-period for gas efficiency */
   singleUpdatePerPeriod: boolean;
+  /** Volatility-adjusted window scaling factor */
+  volatilityWindowScale: number;
+  /** Whether to enable volatility-aware TWAP adjustment */
+  enableVolatilityAdjustment: boolean;
 }
 
 /**
@@ -46,6 +50,8 @@ const DEFAULT_TWAP_CONFIG: TWAPConfig = {
   fallbackToMedian: true,
   maxStalenessSeconds: 60,
   singleUpdatePerPeriod: true,
+  volatilityWindowScale: 1.0,
+  enableVolatilityAdjustment: false,
 };
 
 /**
@@ -97,6 +103,8 @@ export class TWAPService {
    *
    * Implements gas-efficient single-update-per-period: if a TWAP was
    * already computed within the staleness window, returns the cached value.
+   * When volatility adjustment is enabled, the TWAP window is scaled
+   * based on the asset's recent price volatility.
    */
   computeTWAP(
     asset: string,
@@ -125,13 +133,38 @@ export class TWAPService {
       }
     }
 
+    // Compute fresh TWAP from price history, with optional volatility adjustment
+    const history = this.priceHistory.getPriceHistory(upperAsset);
+    let effectiveWindow = this.config.windowSeconds;
+
+    if (this.config.enableVolatilityAdjustment && history.length >= 10) {
+      // Calculate recent volatility (last 10 entries)
+      const recentPrices = history.slice(-10).map((e) => Number(e.price));
+      const priceRange = Math.max(...recentPrices) - Math.min(...recentPrices);
+      const medianPrice = recentPrices.sort((a, b) => a - b)[Math.floor(recentPrices.length / 2)];
+      const relativeVolatility = medianPrice > 0 ? priceRange / medianPrice : 0;
+
+      // Scale window: higher volatility = wider window for stability
+      // Scale factor: 1.0 = base, 2.0 = double window for 20%+ volatility
+      const volatilityFactor = Math.max(0.5, Math.min(3.0, 1.0 + relativeVolatility * 10));
+      effectiveWindow = Math.floor(this.config.windowSeconds * this.config.volatilityWindowScale * volatilityFactor);
+
+      logger.debug(`Volatility-adjusted TWAP window for ${upperAsset}`, {
+        baseWindow: this.config.windowSeconds,
+        volatilityFactor,
+        effectiveWindow,
+        relativeVolatility: relativeVolatility.toFixed(4),
+      });
+    }
+
     // Compute fresh TWAP from price history
-    const twapResult = this.priceHistory.calculateTWAP(upperAsset, this.config.windowSeconds);
+    const twapResult = this.priceHistory.calculateTWAP(upperAsset, effectiveWindow);
 
     if (!twapResult || twapResult.dataPoints < this.config.minDataPoints) {
       logger.warn(`Insufficient data for TWAP for ${upperAsset}`, {
         dataPoints: twapResult?.dataPoints ?? 0,
         required: this.config.minDataPoints,
+        effectiveWindow,
       });
 
       // Fall back to spot price when insufficient history
@@ -142,7 +175,7 @@ export class TWAPService {
         manipulationDetected: false,
         usedFallback: true,
         dataPoints: twapResult?.dataPoints ?? 0,
-        windowSeconds: this.config.windowSeconds,
+        windowSeconds: effectiveWindow,
         lastComputedAt: now,
       };
     }
@@ -182,7 +215,7 @@ export class TWAPService {
       manipulationDetected,
       usedFallback,
       dataPoints: twapResult.dataPoints,
-      windowSeconds: this.config.windowSeconds,
+      windowSeconds: effectiveWindow,
       lastComputedAt: now,
     };
   }

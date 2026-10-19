@@ -29,6 +29,8 @@ export enum IncidentType {
   PRICE_VOLATILITY = 'PRICE_VOLATILITY',
   ORACLE_FAILURE = 'ORACLE_FAILURE',
   RECOVERY = 'RECOVERY',
+  UPDATE_CADENCE = 'UPDATE_CADENCE', // New: update cadence issue
+  PRICE_DISPUTE = 'PRICE_DISPUTE',   // New: price dispute
 }
 
 /**
@@ -329,6 +331,94 @@ export class OracleIncidentMonitor {
         });
       }
     }
+  }
+
+  /**
+   * Record a price dispute for an asset
+   */
+  recordPriceDispute(asset: string, reason: string, evidence: string[] = []): string {
+    const upper = asset.toUpperCase();
+    const incidentKey = 'DISPUTE_${upper}';
+
+    // Check cooldown to avoid duplicate disputes
+    const lastDispute = this.lastAlertTime.get(incidentKey);
+    if (lastDispute && Date.now() - lastDispute < this.ALERT_COOLDOWN * 1000) {
+      return this.getDisputeId(asset) ?? '';
+    }
+
+    const incident: OracleIncident = {
+      id: `${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+      type: IncidentType.PRICE_DISPUTE,
+      severity: IncidentSeverity.ALERT,
+      asset: upper,
+      timestamp: Math.floor(Date.now() / 1000),
+      message: reason,
+      details: {
+        evidence,
+        disputeId: 'DISPUTE_${Date.now()}',
+      },
+    };
+
+    this.incidents.set(incident.id, incident);
+    this.lastAlertTime.set(incidentKey, Date.now());
+
+    logger.warn('Oracle price dispute recorded', {
+      incidentId: incident.id,
+      asset: upper,
+      reason,
+    });
+
+    return incident.id;
+  }
+
+  /**
+   * Get dispute ID for an asset if one exists
+   */
+  private getDisputeId(asset: string): string | undefined {
+    const upper = asset.toUpperCase();
+    const disputes = Array.from(this.incidents.values()).filter(
+      (i) => i.type === IncidentType.PRICE_DISPUTE && i.asset === upper && !i.resolvedAt
+    );
+    return disputes.length > 0 ? disputes[0].id : undefined;
+  }
+
+  /**
+   * Resolve a price dispute
+   */
+  resolvePriceDispute(disputeId: string, resolution: 'approved' | 'rejected', resolvedBy: string): void {
+    const incident = this.incidents.get(disputeId);
+    if (!incident) {
+      logger.warn('Dispute ${disputeId} not found');
+      return;
+    }
+
+    incident.resolvedAt = Math.floor(Date.now() / 1000);
+    incident.recoveryDetails = {
+      resolution,
+      resolvedBy,
+      resolvedAt: incident.resolvedAt,
+    };
+
+    // If rejected, keep the asset paused and investigate
+    // If approved, remove the pause and continue
+    if (resolution === 'rejected') {
+      logger.error('Price dispute ${disputeId} rejected - initiating investigation', {
+        asset: incident.asset,
+      });
+      // Keep paused - the asset remains paused for investigation
+    } else {
+      // Approved - remove any pause state
+      this.pausedAssets.delete(incident.asset);
+      logger.info('Price dispute ${disputeId} approved - asset recovered', {
+        asset: incident.asset,
+      });
+    }
+
+    logger.info('Price dispute resolved', {
+      disputeId,
+      asset: incident.asset,
+      resolution,
+    });
   }
 
   /**

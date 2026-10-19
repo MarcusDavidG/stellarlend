@@ -6,6 +6,7 @@
  * - Update frequency and error rates
  * - Provider health status
  * - Asset price ages
+ * - Update cadence and staleness tracking
  */
 
 import http from 'http';
@@ -22,6 +23,7 @@ export type ProviderHealth = 'healthy' | 'degraded' | 'unhealthy';
 export interface AssetPriceInfo {
   price: number;
   age: number; // seconds since last update
+  lastUpdate: number; // unix timestamp
 }
 
 /**
@@ -34,6 +36,8 @@ export interface MetricsResponse {
   errorCount: number;
   providers: Record<string, ProviderHealth>;
   assets: Record<string, AssetPriceInfo>;
+  updateCadence: Record<string, number>; // seconds between updates per asset
+  staleness: Record<string, number>; // seconds since last update per asset
 }
 
 /**
@@ -46,6 +50,8 @@ export class MetricsService {
   private lastUpdate: number | null = null;
   private providerHealth: Map<string, ProviderHealth> = new Map();
   private assetPrices: Map<string, { price: number; timestamp: number }> = new Map();
+  private lastUpdateTimestamp: Map<string, number> = new Map(); // per-asset last update timestamp
+  private updateIntervals: Map<string, number[]> = new Map(); // per-asset recent intervals
   private server?: http.Server;
   private port: number;
 
@@ -102,9 +108,25 @@ export class MetricsService {
   /**
    * Record a successful price update
    */
-  recordUpdate(): void {
+  recordUpdate(asset?: string): void {
     this.updateCount++;
     this.lastUpdate = Date.now();
+
+    if (asset) {
+      this.lastUpdateTimestamp.set(asset, Date.now());
+
+      // Track update interval
+      const prevTimestamp = this.lastUpdateTimestamp.get(asset);
+      if (prevTimestamp) {
+        const interval = Date.now() - prevTimestamp;
+        let intervals = this.updateIntervals.get(asset) ?? [];
+        intervals.push(interval);
+        if (intervals.length > 30) {
+          intervals = intervals.slice(-30); // Keep last 30 intervals
+        }
+        this.updateIntervals.set(asset, intervals);
+      }
+    }
   }
 
   /**
@@ -129,6 +151,7 @@ export class MetricsService {
       price,
       timestamp: Date.now(),
     });
+    this.lastUpdateTimestamp.set(asset, Date.now());
   }
 
   /**
@@ -150,10 +173,32 @@ export class MetricsService {
     const assets: Record<string, AssetPriceInfo> = {};
     for (const [asset, data] of this.assetPrices.entries()) {
       const age = Math.floor((Date.now() - data.timestamp) / 1000);
+      const lastUpdate = this.lastUpdateTimestamp.get(asset) ?? 0;
       assets[asset] = {
         price: data.price,
         age,
+        lastUpdate,
       };
+    }
+
+    // Calculate update cadence per asset
+    const updateCadence: Record<string, number> = {};
+    for (const [asset, intervals] of this.updateIntervals.entries()) {
+      if (intervals.length >= 2) {
+        const avgInterval =
+          intervals.reduce((sum, interval) => sum + interval, 0) / intervals.length;
+        updateCadence[asset] = Math.round(avgInterval / 1000); // seconds
+      } else if (intervals.length === 1) {
+        updateCadence[asset] = Math.round(intervals[0] / 1000);
+      }
+    }
+
+    // Calculate staleness per asset
+    const staleness: Record<string, number> = {};
+    const now = Date.now();
+    for (const [asset, data] of this.assetPrices.entries()) {
+      const ageSeconds = Math.floor((now - data.timestamp) / 1000);
+      staleness[asset] = ageSeconds;
     }
 
     return {
@@ -163,6 +208,8 @@ export class MetricsService {
       errorCount: this.errorCount,
       providers,
       assets,
+      updateCadence,
+      staleness,
     };
   }
 
@@ -196,6 +243,8 @@ export class MetricsService {
     this.lastUpdate = null;
     this.providerHealth.clear();
     this.assetPrices.clear();
+    this.lastUpdateTimestamp.clear();
+    this.updateIntervals.clear();
     this.startTime = Date.now();
   }
 }
